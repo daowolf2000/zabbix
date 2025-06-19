@@ -1,0 +1,115 @@
+#!/bin/bash
+echo ----------------------------------------------------------
+echo `date +"%Y-%m-%d %H:%M:%S"` "Запуск скрипта конфигурирования параметров VM"
+echo "Проверка наличия изменений"
+diff -q <(vmtoolsd --cmd "info-get guestinfo.ovfEnv" | grep Property) <(cat /root/ovfEnv.old | grep Property) && exit 0
+#diff -q <(vmtoolsd --cmd "info-get guestinfo.ovfEnv") /root/ovfEnv.old && (echo "Изменений в конфигурационных данных нет, выход" ; exit 0)
+echo "Обнаружены изменения параметров, выполняем актуализацию данных"
+ovfEnv=`vmtoolsd --cmd "info-get guestinfo.ovfEnv" | tee /root/ovfEnv.old`
+
+#checkip="^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$"
+getvmenv() { echo $ovfEnv | grep -oPm1 "(?<=$1\" oe:value=\")[^/\"]+" ;}
+checkip() { echo $1 | grep -E "^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$" &>/dev/null || { echo "Ошибка. $1 не является корректным IP адресов" ; exit 1 ;} ;}
+
+echo "Получение параметров и контроль значений"
+ip=`getvmenv "guestinfo.network.ip"` ; checkip $ip || exit 1
+mask=`getvmenv "guestinfo.network.mask"` ; checkip $mask || exit 1
+gateway=`getvmenv "guestinfo.network.gateway"` ; checkip $gateway || exit 1
+dns1=`getvmenv "guestinfo.network.dns1"` ; checkip $dns1 || exit 1
+dns2=`getvmenv "guestinfo.network.dns2"` ; checkip $dns2 || exit 1
+domain=`getvmenv "guestinfo.network.domain"` ; echo $domain | grep ".*\..*"  &>/dev/null || { echo "Неккоректный параметр domain=$domain" ; exit 1; }
+hostname=`getvmenv "guestinfo.network.hostname"` ; echo $hostname | grep ".*" &>/dev/null || { echo "Неккоректный параметр hostname=$hostname" ; exit 1; }
+zbx_server=`getvmenv "guestinfo.service.zbx.server.ip"` ; checkip  $zbx_server || exit 1
+passport_server=`getvmenv "guestinfo.service.passport.ip"` ; checkip  $passport_server || exit 1
+kes_server=`getvmenv "guestinfo.service.kes.ip"` ; checkip  $kes_server || exit 1
+
+
+echo "Запись параметров в файл /etc/network/interfaces.d/eth0"
+cat <<EOF> /etc/network/interfaces.d/eth0
+auto eth0
+iface eth0 inet static
+address $ip
+gateway $gateway
+netmask $mask
+EOF
+
+echo "Запись параметров в файл /etc/resolv.conf"
+cat <<EOF> /etc/resolv.conf
+nameserver $dns1 $dns2
+domain $domain
+EOF
+
+echo "Перезапуск службы networking"
+systemctl restart networking
+
+
+echo "Переименовываем компьютер"
+hostnamectl set-hostname $hostname
+echo $hostname > /etc/hostname
+
+echo "Правим файл /etc/hosts"
+cat <<EOF> /etc/hosts
+127.0.0.1       localhost
+127.0.1.1       $hostname
+
+# The following lines are desirable for IPv6 capable hosts
+::1     localhost ip6-localhost ip6-loopback
+ff02::1 ip6-allnodes
+ff02::2 ip6-allrouters
+EOF
+
+echo "Экспортируем переменные для Docker-Compose (Zabbix)"
+cat << EOF > /etc/profile.d/zbx.sh
+export DNS_NAMESERVER1=$dns1
+export DNS_NAMESERVER2=$dns2
+export DNS_SEARCH=$domain
+export ZBX_SERVER=$zbx_server
+export HOSTNAME=$hostname
+EOF
+
+echo "Очищаем БД прокси-сервера"
+systemctl stop zbx
+rm -f /opt/zbx/db_data/*
+#rm -f /opt/zbx/snmptraps/*
+systemctl start zbx
+
+
+echo "Настройка синхронизации времени (timesyncd)"
+cat  << EOF > /etc/systemd/timesyncd.conf
+[Time]
+NTP=$zbx_server
+EOF
+systemctl restart systemd-timesyncd
+
+echo "Настройка Zabbix Agent"
+cat << EOF > /etc/zabbix/zabbix_agentd.conf
+PidFile=/run/zabbix/zabbix_agentd.pid
+LogFile=/var/log/zabbix-agent/zabbix_agentd.log
+LogFileSize=0
+Include=/etc/zabbix/zabbix_agentd.conf.d/*.conf
+Server=$zbx_server
+ListenIP=0.0.0.0
+ServerActive=$zbx_server
+EOF
+systemctl restart zabbix-agent.service
+
+echo "Настройка Паспорт ПО"
+cat << EOF > /etc/SPPOClient/SystemInfo.ini
+[System_Info]
+RmqServerIp=$passport_server
+RmqServerPort=28997
+RmqReconnect=5
+RmqRpcTimeout=5
+PassportTimeDelta=1
+WorkstationName=$hostname
+OfflineMode=0
+EOF
+systemctl restart SPPOClient.service
+
+echo "Настройка KES"
+/opt/kaspersky/klnagent64/bin/klmover -address $kes_server
+/opt/kaspersky/klnagent64/bin/klnagchk -restart
+
+
+
+exit 0
